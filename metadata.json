@@ -1,0 +1,8 @@
+{
+  "name": "Remix Smart Budget",
+  "description": "Smart Expense \u0026 Budget Manager with category limits, spending trends, income vs expense analytics, and AI financial insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
