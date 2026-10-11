@@ -1,6 +1,6 @@
 import 'dart:math';
 
-import 'package:sqflite/sqflite.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'db_helper.dart';
 
@@ -19,7 +19,7 @@ class TransactionModel {
   final String? note;
   final String createdAt;
 
-  /// Filled only by queries that join the categories table.
+  /// Filled by TxRepo from the categories table (not stored in transactions).
   final String? categoryName;
 
   const TransactionModel({
@@ -30,35 +30,27 @@ class TransactionModel {
     required this.amount,
     required this.transactionDate,
     this.note,
-    required this.createdAt,
+    this.createdAt = '',
     this.categoryName,
   });
 
-  factory TransactionModel.fromMap(Map<String, dynamic> map) {
+  factory TransactionModel.fromMap(
+    Map<String, dynamic> map, {
+    String? categoryName,
+  }) {
     return TransactionModel(
-      id: map['id'] as String,
-      userId: map['user_id'] as String,
-      categoryId: map['category_id'] as int?,
+      id: map['id'].toString(),
+      userId: map['user_id'].toString(),
+      categoryId: map['category_id'] == null
+          ? null
+          : (map['category_id'] as num).toInt(),
       type: map['type'] as String,
-      amount: (map['amount'] as num).toDouble(),
-      transactionDate: map['transaction_date'] as String,
+      amount: _toDouble(map['amount']),
+      transactionDate: map['transaction_date'].toString(),
       note: map['note'] as String?,
-      createdAt: map['created_at'] as String,
-      categoryName: map['category_name'] as String?,
+      createdAt: (map['created_at'] ?? '').toString(),
+      categoryName: categoryName,
     );
-  }
-
-  Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'user_id': userId,
-      'category_id': categoryId,
-      'type': type,
-      'amount': amount,
-      'transaction_date': transactionDate,
-      'note': note,
-      'created_at': createdAt,
-    };
   }
 
   /// Same shape as the API contract's "recentTransactions" items.
@@ -74,19 +66,39 @@ class TransactionModel {
   }
 }
 
+double _toDouble(dynamic value) {
+  if (value == null) return 0;
+  if (value is num) return value.toDouble();
+  return double.tryParse(value.toString()) ?? 0;
+}
+
 // ============================================================
-// TRANSACTION REPOSITORY
-// All SQLite queries for income and expenses.
+// TRANSACTION REPOSITORY (Supabase)
+// All queries for income and expenses.
+//
+// Uses DbHelper.client (Shahzad Ali's db_helper.dart) and the
+// currently signed-in user. The user must sign in with
+// DbHelper.client.auth, otherwise these methods throw StateError.
+// Database errors are thrown as PostgrestException.
 // ============================================================
 
 class TxRepo {
   static const String table = 'transactions';
 
+  static const String _columns =
+      'id, user_id, category_id, type, amount, transaction_date, note, created_at';
+
   static final RegExp _monthPattern = RegExp(r'^\d{4}-(0[1-9]|1[0-2])$');
 
-  /// Uses the database created by db_helper.dart (Shahzad Ali).
-  /// Expected API: DbHelper.instance.database -> Future<Database>
-  Future<Database> get _db async => DbHelper.instance.database;
+  SupabaseClient get _client => DbHelper.client;
+
+  String get _userId {
+    final id = _client.auth.currentUser?.id;
+    if (id == null) {
+      throw StateError('Please sign in before using transactions.');
+    }
+    return id;
+  }
 
   // ------------------------------------------------------------
   // INSERT
@@ -95,7 +107,6 @@ class TxRepo {
   /// Saves a new income or expense and returns the saved record.
   /// Mirrors POST /api/transactions.
   Future<TransactionModel> insertTransaction({
-    required String userId,
     required String type,
     required double amount,
     required DateTime date,
@@ -103,30 +114,24 @@ class TxRepo {
     String? note,
   }) async {
     _validateType(type);
+    _validateAmount(amount);
 
-    if (amount <= 0) {
-      throw ArgumentError('Amount must be greater than zero.');
-    }
+    final row = await _client
+        .from(table)
+        .insert({
+          'id': _generateId(),
+          'user_id': _userId,
+          'category_id': categoryId,
+          'type': type,
+          'amount': amount,
+          'transaction_date': _formatDate(date),
+          'note': _cleanNote(note),
+        })
+        .select(_columns)
+        .single();
 
-    final tx = TransactionModel(
-      id: _generateId(),
-      userId: userId,
-      categoryId: categoryId,
-      type: type,
-      amount: amount,
-      transactionDate: _formatDate(date),
-      note: (note == null || note.trim().isEmpty) ? null : note.trim(),
-      createdAt: DateTime.now().toIso8601String(),
-    );
-
-    final db = await _db;
-    await db.insert(
-      table,
-      tx.toMap(),
-      conflictAlgorithm: ConflictAlgorithm.abort,
-    );
-
-    return tx;
+    final names = await _categoryNames();
+    return _toModel(row, names);
   }
 
   // ------------------------------------------------------------
@@ -137,7 +142,6 @@ class TxRepo {
   /// Mirrors GET /api/transactions
   /// (?type=expense&categoryId=1&startDate=...&endDate=...).
   Future<List<TransactionModel>> getTransactions({
-    required String userId,
     String? type,
     int? categoryId,
     DateTime? startDate,
@@ -145,72 +149,52 @@ class TxRepo {
     int? limit,
     int? offset,
   }) async {
-    final where = <String>['t.user_id = ?'];
-    final args = <Object?>[userId];
+    var query = _client.from(table).select(_columns).eq('user_id', _userId);
 
     if (type != null) {
       _validateType(type);
-      where.add('t.type = ?');
-      args.add(type);
+      query = query.eq('type', type);
     }
     if (categoryId != null) {
-      where.add('t.category_id = ?');
-      args.add(categoryId);
+      query = query.eq('category_id', categoryId);
     }
     if (startDate != null) {
-      where.add('t.transaction_date >= ?');
-      args.add(_formatDate(startDate));
+      query = query.gte('transaction_date', _formatDate(startDate));
     }
     if (endDate != null) {
-      where.add('t.transaction_date <= ?');
-      args.add(_formatDate(endDate));
+      query = query.lte('transaction_date', _formatDate(endDate));
     }
 
-    final sql = StringBuffer()
-      ..write('SELECT t.*, c.name AS category_name ')
-      ..write('FROM $table t ')
-      ..write('LEFT JOIN categories c ON c.id = t.category_id ')
-      ..write('WHERE ${where.join(' AND ')} ')
-      ..write('ORDER BY t.transaction_date DESC, t.created_at DESC');
+    var ordered = query
+        .order('transaction_date', ascending: false)
+        .order('created_at', ascending: false);
 
     if (limit != null) {
-      sql.write(' LIMIT ?');
-      args.add(limit);
-      if (offset != null) {
-        sql.write(' OFFSET ?');
-        args.add(offset);
-      }
+      final from = offset ?? 0;
+      ordered = ordered.range(from, from + limit - 1);
     }
 
-    final db = await _db;
-    final rows = await db.rawQuery(sql.toString(), args);
-    return rows.map(TransactionModel.fromMap).toList();
+    final rows = await ordered;
+    final names = await _categoryNames();
+    return rows.map((row) => _toModel(row, names)).toList();
   }
 
   /// Latest transactions for the dashboard's "recentTransactions" list.
-  Future<List<TransactionModel>> getRecentTransactions(
-    String userId, {
-    int limit = 5,
-  }) {
-    return getTransactions(userId: userId, limit: limit);
+  Future<List<TransactionModel>> getRecentTransactions({int limit = 5}) {
+    return getTransactions(limit: limit);
   }
 
-  Future<TransactionModel?> getTransactionById(
-    String id,
-    String userId,
-  ) async {
-    final db = await _db;
-    final rows = await db.rawQuery(
-      'SELECT t.*, c.name AS category_name '
-      'FROM $table t '
-      'LEFT JOIN categories c ON c.id = t.category_id '
-      'WHERE t.id = ? AND t.user_id = ? '
-      'LIMIT 1',
-      [id, userId],
-    );
+  Future<TransactionModel?> getTransactionById(String id) async {
+    final row = await _client
+        .from(table)
+        .select(_columns)
+        .eq('id', id)
+        .eq('user_id', _userId)
+        .maybeSingle();
 
-    if (rows.isEmpty) return null;
-    return TransactionModel.fromMap(rows.first);
+    if (row == null) return null;
+    final names = await _categoryNames();
+    return _toModel(row, names);
   }
 
   // ------------------------------------------------------------
@@ -220,7 +204,6 @@ class TxRepo {
   /// Returns true if a row was updated.
   Future<bool> updateTransaction({
     required String id,
-    required String userId,
     required String type,
     required double amount,
     required DateTime date,
@@ -228,38 +211,34 @@ class TxRepo {
     String? note,
   }) async {
     _validateType(type);
+    _validateAmount(amount);
 
-    if (amount <= 0) {
-      throw ArgumentError('Amount must be greater than zero.');
-    }
+    final rows = await _client
+        .from(table)
+        .update({
+          'type': type,
+          'amount': amount,
+          'transaction_date': _formatDate(date),
+          'category_id': categoryId,
+          'note': _cleanNote(note),
+        })
+        .eq('id', id)
+        .eq('user_id', _userId)
+        .select('id');
 
-    final db = await _db;
-    final count = await db.update(
-      table,
-      {
-        'type': type,
-        'amount': amount,
-        'transaction_date': _formatDate(date),
-        'category_id': categoryId,
-        'note': (note == null || note.trim().isEmpty) ? null : note.trim(),
-      },
-      where: 'id = ? AND user_id = ?',
-      whereArgs: [id, userId],
-    );
-
-    return count > 0;
+    return rows.isNotEmpty;
   }
 
   /// Returns true if a row was deleted.
-  Future<bool> deleteTransaction(String id, String userId) async {
-    final db = await _db;
-    final count = await db.delete(
-      table,
-      where: 'id = ? AND user_id = ?',
-      whereArgs: [id, userId],
-    );
+  Future<bool> deleteTransaction(String id) async {
+    final rows = await _client
+        .from(table)
+        .delete()
+        .eq('id', id)
+        .eq('user_id', _userId)
+        .select('id');
 
-    return count > 0;
+    return rows.isNotEmpty;
   }
 
   // ------------------------------------------------------------
@@ -268,112 +247,103 @@ class TxRepo {
 
   /// All-time balance: total income minus total expenses.
   /// Used for "totalBalance" on the dashboard.
-  Future<double> getTotalBalance(String userId) async {
-    final db = await _db;
-    final rows = await db.rawQuery(
-      "SELECT "
-      "COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS income, "
-      "COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS expenses "
-      "FROM $table WHERE user_id = ?",
-      [userId],
-    );
+  Future<double> getTotalBalance() async {
+    final rows =
+        await _client.from(table).select('type, amount').eq('user_id', _userId);
 
-    final income = (rows.first['income'] as num).toDouble();
-    final expenses = (rows.first['expenses'] as num).toDouble();
+    double income = 0;
+    double expenses = 0;
+    for (final row in rows) {
+      final amount = _toDouble(row['amount']);
+      if (row['type'] == 'income') {
+        income += amount;
+      } else {
+        expenses += amount;
+      }
+    }
     return income - expenses;
   }
 
   /// Income and expense totals for one month ([monthYear] = 'YYYY-MM').
   /// Returns {'income': x, 'expenses': y}.
-  Future<Map<String, double>> getMonthlyTotals(
-    String userId,
-    String monthYear,
-  ) async {
-    _validateMonth(monthYear);
+  Future<Map<String, double>> getMonthlyTotals(String monthYear) async {
+    final rows = await _monthRows(monthYear, 'type, amount');
 
-    final db = await _db;
-    final rows = await db.rawQuery(
-      "SELECT "
-      "COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE 0 END), 0) AS income, "
-      "COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0) AS expenses "
-      "FROM $table "
-      "WHERE user_id = ? AND strftime('%Y-%m', transaction_date) = ?",
-      [userId, monthYear],
-    );
-
-    return {
-      'income': (rows.first['income'] as num).toDouble(),
-      'expenses': (rows.first['expenses'] as num).toDouble(),
-    };
+    double income = 0;
+    double expenses = 0;
+    for (final row in rows) {
+      final amount = _toDouble(row['amount']);
+      if (row['type'] == 'income') {
+        income += amount;
+      } else {
+        expenses += amount;
+      }
+    }
+    return {'income': income, 'expenses': expenses};
   }
 
   /// Expense breakdown by category for one month, largest first.
   /// Same shape as the API's "spendingSummary":
   /// [{category, amount, percentage}].
   Future<List<Map<String, dynamic>>> getSpendingSummary(
-    String userId,
     String monthYear,
   ) async {
-    _validateMonth(monthYear);
+    final rows = await _monthRows(monthYear, 'type, amount, category_id');
+    final names = await _categoryNames();
 
-    final db = await _db;
-    final rows = await db.rawQuery(
-      "SELECT COALESCE(c.name, 'Uncategorized') AS category, "
-      "SUM(t.amount) AS amount "
-      "FROM $table t "
-      "LEFT JOIN categories c ON c.id = t.category_id "
-      "WHERE t.user_id = ? AND t.type = 'expense' "
-      "AND strftime('%Y-%m', t.transaction_date) = ? "
-      "GROUP BY category "
-      "ORDER BY amount DESC",
-      [userId, monthYear],
-    );
+    final byName = <String, double>{};
+    double total = 0;
+    for (final row in rows) {
+      if (row['type'] != 'expense') continue;
 
-    final total = rows.fold<double>(
-      0,
-      (sum, row) => sum + (row['amount'] as num).toDouble(),
-    );
+      final amount = _toDouble(row['amount']);
+      final id = row['category_id'] == null
+          ? null
+          : (row['category_id'] as num).toInt();
+      final name = (id == null ? null : names[id]) ?? 'Uncategorized';
 
-    return rows.map((row) {
-      final amount = (row['amount'] as num).toDouble();
+      byName[name] = (byName[name] ?? 0) + amount;
+      total += amount;
+    }
+
+    final entries = byName.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    return entries.map((e) {
       return {
-        'category': row['category'] as String,
-        'amount': amount,
-        'percentage': total == 0 ? 0 : (amount / total * 100).round(),
+        'category': e.key,
+        'amount': e.value,
+        'percentage': total == 0 ? 0 : (e.value / total * 100).round(),
       };
     }).toList();
   }
 
-  /// Total spent in one category for one month.
-  /// Used by the budget logic (Naeem Khan) for progress bars.
-  Future<double> getCategorySpent(
-    String userId,
-    int categoryId,
-    String monthYear,
-  ) async {
-    _validateMonth(monthYear);
+  /// Expenses per category id for one month: {categoryId: spent}.
+  /// Used by the budget screens for progress bars.
+  Future<Map<int, double>> getSpentByCategory(String monthYear) async {
+    final rows = await _monthRows(monthYear, 'type, amount, category_id');
 
-    final db = await _db;
-    final rows = await db.rawQuery(
-      "SELECT COALESCE(SUM(amount), 0) AS total "
-      "FROM $table "
-      "WHERE user_id = ? AND category_id = ? AND type = 'expense' "
-      "AND strftime('%Y-%m', transaction_date) = ?",
-      [userId, categoryId, monthYear],
-    );
+    final spent = <int, double>{};
+    for (final row in rows) {
+      if (row['type'] != 'expense' || row['category_id'] == null) continue;
 
-    return (rows.first['total'] as num).toDouble();
+      final id = (row['category_id'] as num).toInt();
+      spent[id] = (spent[id] ?? 0) + _toDouble(row['amount']);
+    }
+    return spent;
   }
 
-  /// Compact summary for the AI service (Sahar's
-  /// AiService.generateInsights / askQuestion expect a Map).
-  Future<Map<String, dynamic>> getFinancialSummary(
-    String userId,
-    String monthYear,
-  ) async {
-    final totals = await getMonthlyTotals(userId, monthYear);
-    final spending = await getSpendingSummary(userId, monthYear);
-    final recent = await getRecentTransactions(userId, limit: 10);
+  /// Total spent in one category for one month.
+  Future<double> getCategorySpent(int categoryId, String monthYear) async {
+    final spent = await getSpentByCategory(monthYear);
+    return spent[categoryId] ?? 0;
+  }
+
+  /// Compact summary for the AI service and the AI insights screens.
+  Future<Map<String, dynamic>> getFinancialSummary(String monthYear) async {
+    final totals = await getMonthlyTotals(monthYear);
+    final spending = await getSpendingSummary(monthYear);
+    final recent = await getRecentTransactions(limit: 10);
 
     return {
       'month': monthYear,
@@ -388,16 +358,66 @@ class TxRepo {
   // HELPERS
   // ------------------------------------------------------------
 
+  /// Rows of the current user whose transaction_date is in [monthYear].
+  Future<List<Map<String, dynamic>>> _monthRows(
+    String monthYear,
+    String columns,
+  ) async {
+    if (!_monthPattern.hasMatch(monthYear)) {
+      throw ArgumentError("Month must use the format 'YYYY-MM'.");
+    }
+
+    final year = int.parse(monthYear.substring(0, 4));
+    final month = int.parse(monthYear.substring(5, 7));
+    final nextYear = month == 12 ? year + 1 : year;
+    final nextMonth = month == 12 ? 1 : month + 1;
+
+    final start = '$monthYear-01';
+    final end = '${nextYear.toString().padLeft(4, '0')}-'
+        '${nextMonth.toString().padLeft(2, '0')}-01';
+
+    final rows = await _client
+        .from(table)
+        .select(columns)
+        .eq('user_id', _userId)
+        .gte('transaction_date', start)
+        .lt('transaction_date', end);
+
+    return List<Map<String, dynamic>>.from(rows);
+  }
+
+  /// {categoryId: categoryName} from the categories table.
+  Future<Map<int, String>> _categoryNames() async {
+    final categories = await DbHelper.getCategories();
+    return {
+      for (final c in categories) (c['id'] as num).toInt(): c['name'] as String,
+    };
+  }
+
+  TransactionModel _toModel(Map<String, dynamic> row, Map<int, String> names) {
+    final categoryId =
+        row['category_id'] == null ? null : (row['category_id'] as num).toInt();
+    return TransactionModel.fromMap(
+      row,
+      categoryName: categoryId == null ? null : names[categoryId],
+    );
+  }
+
   void _validateType(String type) {
     if (type != 'income' && type != 'expense') {
       throw ArgumentError("Type must be 'income' or 'expense'.");
     }
   }
 
-  void _validateMonth(String monthYear) {
-    if (!_monthPattern.hasMatch(monthYear)) {
-      throw ArgumentError("Month must use the format 'YYYY-MM'.");
+  void _validateAmount(double amount) {
+    if (amount <= 0) {
+      throw ArgumentError('Amount must be greater than zero.');
     }
+  }
+
+  String? _cleanNote(String? note) {
+    if (note == null || note.trim().isEmpty) return null;
+    return note.trim();
   }
 
   String _formatDate(DateTime date) {
@@ -414,8 +434,7 @@ class TxRepo {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
 
-    final hex =
-        bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+    final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
     return '${hex.substring(0, 8)}-'
         '${hex.substring(8, 12)}-'
